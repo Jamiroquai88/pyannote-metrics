@@ -4,7 +4,7 @@ import pyannote.core
 from pyannote.core import Annotation
 from pyannote.core import Segment
 from pyannote.core import Timeline
-from pyannote.metrics.diarization import DiarizationErrorRate
+from pyannote.metrics.diarization import DiarizationErrorRate, WordDiarizationErrorRate
 from pyannote.metrics.diarization import DiarizationPurity
 from pyannote.metrics.diarization import DiarizationCoverage
 
@@ -18,6 +18,15 @@ def reference():
     reference[Segment(12, 20)] = 'B'
     reference[Segment(24, 27)] = 'A'
     reference[Segment(30, 40)] = 'C'
+    return reference
+
+@pytest.fixture
+def reference_words():
+    reference = Annotation()
+    reference[Segment(7, 9)] = 'A'  # 'hello'
+    reference[Segment(14, 15)] = 'B'  # 'hi'
+    reference[Segment(23, 26)] = 'A'  # 'when'
+    reference[Segment(34, 36)] = 'C'  # 'now'
     return reference
 
 @pytest.fixture
@@ -109,3 +118,8 @@ def test_bug_16():
     metric = DiarizationErrorRate(collar=0)
     total = metric(reference, hypothesis, detailed=True)['total']
     npt.assert_almost_equal(total, 10, decimal=3)
+
+def test_word_diarization_error_rate(reference_words, hypothesis):
+    metric = WordDiarizationErrorRate()
+    wder = metric(reference_words, hypothesis, detailed=True)['Word Diarization Error Rate']
+    npt.assert_almost_equal(wder, 0.25, decimal=3)

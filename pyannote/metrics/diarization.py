@@ -27,8 +27,10 @@
 # Hervé BREDIN - http://herve.niderb.fr
 
 """Metrics for diarization"""
+from collections import defaultdict
 from typing import Optional, Dict, TYPE_CHECKING
 
+from intervaltree import IntervalTree, Interval
 import numpy as np
 from pyannote.core import Annotation, Timeline
 from pyannote.core.utils.types import Label
@@ -792,3 +794,207 @@ class DiarizationCompleteness(DiarizationHomogeneity):
                            **kwargs) -> Details:
         return super(DiarizationCompleteness, self) \
             .compute_components(hypothesis, reference, uem=uem, **kwargs)
+
+
+WDER = 'Word Diarization Error Rate'
+WDER_INCORRECT = 'Word Diarization Error Rate Incorrect Words'
+WDER_TOTAL = 'Word Diarization Error Rate Total Words'
+WDER_SPEAKER_SWITCH = 'Word Diarization Error Rate Speaker Switch'
+WDER_SPEAKER_SWITCH_INCORRECT = 'Word Diarization Error Rate Speaker Switch Incorrect Words'
+WDER_SPEAKER_SWITCH_TOTAL = 'Word Diarization Error Rate Speaker Switch Total Words'
+
+
+class WordDiarizationErrorRate(IdentificationErrorRate):
+    """Word diarization error rate
+
+    First, the optimal mapping between reference and hypothesis labels
+    is obtained using the Hungarian algorithm. For each word, the diarization system’s assigned
+    speaker label is compared to the reference speaker label. If the assigned speaker is incorrect,
+    it’s considered an error.
+
+    WDER is calculated as:
+        WDER = (SIS + CIS) / (S + C)
+        where,
+            SIS = substitutions with incorrect speaker label
+            CIS = correct ASR words with incorrect speaker label
+            S   = number of ASR substitutions
+            C   = number of correct ASR words
+
+    Reference Transcript and Speaker Labels
+
+    | Word  | Reference Speaker |
+    |-------|-------------------|
+    | Hello | Speaker 1         |
+    | How   | Speaker 1         |
+    | are   | Speaker 1         |
+    | you   | Speaker 1         |
+    | today | Speaker 2         |
+
+    Diarization System's Output
+
+    | Word  | Diarization Output Speaker |
+    |-------|----------------------------|
+    | Hello | Speaker 1                  |
+    | How   | Speaker 2                  |
+    | are   | Speaker 1                  |
+    | you   | Speaker 1                  |
+    | today | Speaker 1                  |
+
+    In this example, the word “How” was incorrectly assigned to Speaker 2 instead of Speaker 1,
+    and the word “today” was incorrectly assigned to Speaker 1 instead of Speaker 2.
+    These are the two errors that contribute to the Word Diarization Error Rate (WDER) calculation.
+    WDER = 2 / 5 = 0.4. This means that 40% of the words were assigned to the wrong speaker.
+
+    Usage
+    ----------
+
+    * Word diarization error rate between `reference` and `hypothesis` annotations
+
+        >>> metric = WordDiarizationErrorRate()
+        >>> reference = Annotation(...)                 # doctest: +SKIP
+        >>> reference_words = Annotation(...)           # doctest: +SKIP
+        >>> hypothesis = Annotation(...)                # doctest: +SKIP
+        >>> value = metric(reference, hypothesis)       # doctest: +SKIP
+
+    See Also
+    ----------
+    :class:`pyannote.metric.base.BaseMetric`: details on accumulation
+    :class:`pyannote.metric.identification.IdentificationErrorRate`: identification error rate
+    :class:`pyannote.metrics.diarization.DiarizationErrorRate`: diarization error rate
+    """
+
+    @classmethod
+    def metric_name(cls):
+        return WDER
+
+    @classmethod
+    def metric_components(cls):
+        return [WDER, WDER_INCORRECT, WDER_TOTAL,
+                WDER_SPEAKER_SWITCH, WDER_SPEAKER_SWITCH_INCORRECT, WDER_SPEAKER_SWITCH_TOTAL]
+
+    def __init__(self, switch_context=3, **kwargs):
+        super().__init__(**kwargs)
+        self.switch_context = switch_context
+        self.mapper_ = HungarianMapper()
+
+    def compute_components(self,
+                           reference: Annotation,
+                           hypothesis: Annotation,
+                           uem: Optional[Timeline] = None,
+                           **kwargs) -> Details:
+
+        detail = self.init_components()  # fixme define components
+        if len(reference) == 0:
+            return detail
+
+        # crop reference and hypothesis to evaluated regions (uem)
+        reference, hypothesis = self.uemify(reference, hypothesis, uem=uem)
+
+        # make sure reference only contains string labels ('A', 'B', ...)
+        reference = reference.rename_labels(generator='string')
+
+        # make sure hypothesis only contains integer labels (1, 2, ...)
+        hypothesis = hypothesis.rename_labels(generator='int')
+
+        # optimal (int --> str) mapping
+        mapping = self.optimal_mapping(reference, hypothesis)
+
+        hypothesis_spkr_tree = IntervalTree(Interval(segment.start, segment.end, label)
+                                            for segment, _, label in hypothesis.itertracks(yield_label=True))
+
+        # data structures for WDER around speaker switches
+        error_index_set = set()
+        switch_index_set = set()
+        last_spk = list(reference.itertracks(yield_label=True))[0][2]
+        # iterate over both, reference speaker and reference words, make sure they match
+        for i, (segment, _, label) in enumerate(reference.itertracks(yield_label=True)):
+            hyp_speaker = self.speaker_for_segment(segment.start, segment.duration, hypothesis_spkr_tree)
+            if label != mapping[hyp_speaker]:
+                detail[WDER_INCORRECT] += 1
+                error_index_set.add(i)
+            if label != last_spk:
+                switch_bottom = max((i - self.switch_context, 0))
+                switch_top = min((i + self.switch_context, len(reference)))
+                switch_index_set.update(range(switch_bottom, switch_top))
+
+            last_spk = label
+
+        detail[WDER_TOTAL] = len(reference)
+        detail[WDER_SPEAKER_SWITCH_INCORRECT] = len(switch_index_set & error_index_set)
+        detail[WDER_SPEAKER_SWITCH_TOTAL] = len(switch_index_set)
+        detail[WDER] = detail[WDER_INCORRECT] / detail[WDER_TOTAL]
+        detail[WDER_SPEAKER_SWITCH] = detail[WDER_SPEAKER_SWITCH_INCORRECT] / detail[WDER_SPEAKER_SWITCH_TOTAL]
+        return detail
+
+    def compute_metric(self, detail: Details) -> float:
+        return detail[WDER_INCORRECT] / detail[WDER_TOTAL]
+
+    def optimal_mapping(self,
+                        reference: Annotation,
+                        hypothesis: Annotation,
+                        uem: Optional[Timeline] = None) -> Dict[Label, Label]:
+        """Optimal label mapping
+
+        Parameters
+        ----------
+        reference : Annotation
+        hypothesis : Annotation
+            Reference and hypothesis diarization
+        uem : Timeline
+            Evaluation map
+
+        Returns
+        -------
+        mapping : dict
+            Mapping between hypothesis (key) and reference (value) labels
+        """
+
+        # NOTE that this 'uemification' will not be called when
+        # 'optimal_mapping' is called from 'compute_components' as it
+        # has already been done in 'compute_components'
+        if uem:
+            reference, hypothesis = self.uemify(reference, hypothesis, uem=uem)
+
+        # call hungarian mapper
+        return self.mapper_(hypothesis, reference)
+
+    def speaker_for_segment(self,
+                            start: float,
+                            dur: float,
+                            tree: IntervalTree) -> str:
+        """Given a start and duration in seconds, and an interval tree representing
+        speaker segments, return what speaker is speaking.
+
+        If there are overlapping speakers, return the speaker who spoke most of the
+        time. If there are no speakers, return the nearest one.
+
+        The interval tree could represent reference or hypothesis.
+        The data inside the interval tree should be the speaker label.
+        """
+        intervals = tree[start:start + dur]
+
+        # Easy case, only one possible interval
+        if len(intervals) == 1:
+            return intervals.pop().data
+
+        # First special case, no match
+        # so we need to find the nearest interval
+        elif len(intervals) == 0:
+            seg = Interval(start, start + dur)
+            distances = {interval: seg.distance_to(interval)
+                         for interval in tree}
+            if not distances:
+                return ""
+            return min(distances, key=distances.get).data
+
+        # Second special case, overlapping speakers
+        # so we return whichever speaker has majority
+        else:
+            seg = Interval(start, start + dur)
+            overlap_sizes = defaultdict(int)
+            for interval in intervals:
+                i0 = max(seg[0], interval[0])
+                i1 = min(seg[1], interval[1])
+                overlap_sizes[interval.data] += i1 - i0
+            return max(overlap_sizes, key=overlap_sizes.get)
+
