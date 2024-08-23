@@ -873,6 +873,13 @@ class WordDiarizationErrorRate(IdentificationErrorRate):
                 WDER_SPEAKER_SWITCH, WDER_SPEAKER_SWITCH_INCORRECT, WDER_SPEAKER_SWITCH_TOTAL]
 
     def __init__(self, switch_context=3, **kwargs):
+        """
+
+         Parameters
+        ----------
+        switch_context : int
+            Number of tokens that are used to calculate speaker switch WDER
+        """
         super().__init__(**kwargs)
         self.switch_context = switch_context
         self.mapper_ = HungarianMapper()
@@ -898,9 +905,10 @@ class WordDiarizationErrorRate(IdentificationErrorRate):
 
         # optimal (int --> str) mapping
         mapping = self.optimal_mapping(reference, hypothesis)
+        mapped = hypothesis.rename_labels(mapping=mapping)
 
         hypothesis_spkr_tree = IntervalTree(Interval(segment.start, segment.end, label)
-                                            for segment, _, label in hypothesis.itertracks(yield_label=True))
+                                            for segment, _, label in mapped.itertracks(yield_label=True))
 
         # data structures for WDER around speaker switches
         error_index_set = set()
@@ -909,7 +917,8 @@ class WordDiarizationErrorRate(IdentificationErrorRate):
         # iterate over both, reference speaker and reference words, make sure they match
         for i, (segment, _, label) in enumerate(reference.itertracks(yield_label=True)):
             hyp_speaker = self.speaker_for_segment(segment.start, segment.duration, hypothesis_spkr_tree)
-            if label != mapping[hyp_speaker]:
+
+            if label != hyp_speaker:
                 detail[WDER_INCORRECT] += 1
                 error_index_set.add(i)
             if label != last_spk:
